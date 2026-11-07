@@ -1,15 +1,12 @@
-"""
-STEP 3 - The dashboard: "Which drives should we replace this week?"
+"""Streamlit dashboard for prioritizing drives for preventive replacement.
 
 Run:
     streamlit run step3_dashboard.py
 
-It opens in your browser. Use the sliders on the left to set:
-  * how much it costs to replace a drive early
-  * how much a surprise failure costs (lost data, rebuild time, engineer time)
-  * your maintenance budget (how many drives you can swap)
-...and it shows which drives to replace and how much money/failures that saves,
-compared with simple strategies an engineer might use instead.
+The dashboard opens in a browser. Use the sidebar controls to set the cost of
+early replacement, the cost of an unexpected failure, and the maintenance
+budget. It then ranks drives for replacement and compares the estimated
+weighted outcomes with simpler baseline strategies.
 """
 import json
 from pathlib import Path
@@ -43,7 +40,7 @@ st.caption(f"Fleet snapshot on {metrics['snapshot_date']} · predicting failure 
            f"~{metrics['snapshot_drives_estimated']:,.0f} drives in the fleet "
            f"({metrics['snapshot_drives_sampled']:,} shown) · Data: Backblaze Drive Stats")
 
-# ---------------- Controls ----------------
+# ---------------- Dashboard controls ----------------
 with st.sidebar:
     st.header("Your costs")
     c_replace = st.slider("Cost to replace a drive early (£)", 50, 1000, 200, 25)
@@ -53,9 +50,9 @@ with st.sidebar:
                 f"**{c_replace / c_fail:.1%}** (cost to replace ÷ cost of failure).")
 
 
-# ---------------- Strategies ----------------
+# ---------------- Replacement strategies ----------------
 def pick(order_score, eligible=None):
-    """Pick drives in order of score until the budget (in real-fleet drives) is used."""
+    """Select drives by descending score without exceeding the fleet-level budget."""
     df = snap.assign(score=order_score)
     if eligible is not None:
         df = df[eligible]
@@ -71,6 +68,7 @@ def pick(order_score, eligible=None):
 
 
 def evaluate(chosen):
+    """Estimate replacement outcomes and costs for a selected set of drives."""
     s = snap
     is_chosen = s["serial_number"].isin(chosen)
     fails = s["failed_within_horizon"] == 1
@@ -97,7 +95,7 @@ results = pd.DataFrame({name: evaluate(ch) for name, ch in strategies.items()}).
 baseline_cost = results.loc["Do nothing", "Total cost (£)"]
 results["Saving vs doing nothing (£)"] = baseline_cost - results["Total cost (£)"]
 
-# ---------------- Headline numbers ----------------
+# ---------------- Summary metrics ----------------
 ours = results.loc["Our model"]
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Drives to replace", f"{ours['Drives replaced']:,.0f}")
@@ -105,7 +103,7 @@ c2.metric("Failures prevented", f"{ours['Failures caught']:,.0f} of {total_fail:
 c3.metric("Healthy drives replaced", f"{ours['Healthy drives replaced']:,.0f}")
 c4.metric("Money saved vs doing nothing", f"£{ours['Saving vs doing nothing (£)']:,.0f}")
 
-# ---------------- Fleet grid ----------------
+# ---------------- Fleet risk grid ----------------
 st.subheader("The fleet: every square is a drive, coloured by risk")
 grid = snap.sort_values("risk", ascending=False).reset_index(drop=True)
 cols = 60
@@ -133,7 +131,7 @@ st.caption("Black outline = our model says replace it. Sorted from riskiest (top
 st.subheader("How does that compare with simpler strategies?")
 st.dataframe(results.style.format("{:,.0f}"), width="stretch")
 
-# ---------------- Replacement list with reasons ----------------
+# ---------------- Replacement list and explanations ----------------
 st.subheader("Replacement list: and why")
 todo = snap[snap["serial_number"].isin(strategies["Our model"])].sort_values("risk", ascending=False)
 

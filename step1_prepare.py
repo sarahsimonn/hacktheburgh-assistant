@@ -1,19 +1,17 @@
-"""
-STEP 1 - Shrink the Backblaze Drive Stats data into one small file.
+"""Create a compact Parquet dataset from Backblaze Drive Stats archives.
 
-What it does (in plain English):
-  * Reads the daily CSV files straight out of the Backblaze ZIP(s) - no unzipping needed.
-  * Pass 1: finds every drive that FAILED (failure == 1) and the date it failed.
-  * Pass 2: keeps ALL rows for failed drives + a small random sample of healthy drives,
-    and only the ~10 columns we actually need.
-  * Saves everything to ONE small Parquet file you can share with your team.
+The script reads daily CSV files directly from one or more Backblaze ZIP
+archives. It makes two passes: the first identifies drives that have failed,
+and the second retains all rows for those drives, a stable sample of healthy
+drives, and only the columns required by later steps.
 
-Run it like this (from the project folder, with your venv active):
+Run from the project directory with the virtual environment activated:
     python step1_prepare.py data/data_Q1_2025.zip data/data_Q2_2025.zip --out data/drives_small.parquet
 
-Optional:
-    --sample 0.03   keep 3% of healthy drives (default). Lower = faster, higher = more data.
-    --models ST12000NM0008 ST16000NM001G   only keep these drive models
+Options:
+    --sample 0.03  Retain 3% of healthy drives (the default). Lower values
+                   reduce processing time; higher values retain more data.
+    --models ...   Retain only the specified drive models.
 """
 import argparse
 from pathlib import Path
@@ -22,24 +20,24 @@ import zlib
 
 import pandas as pd
 
-# SMART stats we keep. Each is a health sensor the drive reports about itself.
+# SMART attributes retained for feature engineering and dashboard explanations.
 SMART_IDS = [
-    5,    # Reallocated sectors - bad spots the drive has had to swap out
-    9,    # Power-on hours - how old the drive is (in use)
-    12,   # Power cycle count - how many times it has been switched on/off
-    187,  # Reported uncorrectable errors
-    188,  # Command timeouts
-    194,  # Temperature
-    197,  # Current pending sectors - spots waiting to be checked/swapped
-    198,  # Offline uncorrectable sectors
-    199,  # UDMA CRC errors - usually cable/connection problems
+    5,    # Reallocated sectors.
+    9,    # Power-on hours.
+    12,   # Power-cycle count.
+    187,  # Reported uncorrectable errors.
+    188,  # Command timeouts.
+    194,  # Drive temperature.
+    197,  # Current pending sectors.
+    198,  # Offline uncorrectable sectors.
+    199,  # UDMA CRC errors.
 ]
 SMART_COLS = [f"smart_{i}_raw" for i in SMART_IDS]
 BASE_COLS = ["date", "serial_number", "model", "capacity_bytes", "failure"]
 
 
 def list_daily_csvs(zip_paths):
-    """Yield (zip_path, csv_name) for every daily CSV inside the ZIPs, in date order."""
+    """Yield each daily CSV as a ``(zip_path, csv_name)`` pair in filename order."""
     for zp in zip_paths:
         with zipfile.ZipFile(zp) as z:
             names = [
@@ -53,7 +51,7 @@ def list_daily_csvs(zip_paths):
 
 
 def read_csv_from_zip(zip_path, name, wanted, required):
-    """Read one daily CSV from inside the ZIP, only loading the columns we want."""
+    """Read selected columns from one daily CSV stored inside a ZIP archive."""
     with zipfile.ZipFile(zip_path) as z, z.open(name) as f:
         df = pd.read_csv(f, usecols=lambda c: c in wanted, low_memory=False)
     missing = required - set(df.columns)
@@ -80,8 +78,8 @@ def main():
         raise SystemExit("No CSV files found inside the ZIP(s). Check the file paths.")
     print(f"Found {len(files)} daily files.")
 
-    # ---------- Pass 1: which drives failed, and when? ----------
-    failed = {}  # serial_number -> failure date
+    # ---------- Pass 1: identify failed drives ----------
+    failed = {}  # Maps each failed serial number to its recorded failure date.
     for i, (zp, name) in enumerate(files, 1):
         df = read_csv_from_zip(
             zp, name, {"date", "serial_number", "failure", "model"},
@@ -95,12 +93,12 @@ def main():
         if i % 10 == 0 or i == len(files):
             print(f"  pass 1: {i}/{len(files)} files, failures so far: {len(failed)}")
 
-    # ---------- Pass 2: keep failed drives + a sample of healthy ones ----------
+    # ---------- Pass 2: retain failed drives and a stable healthy-drive sample ----------
     threshold = int(args.sample * 10_000)
     keep_cache = {}
 
     def keep(serial):
-        # Same drive always gets the same decision on every day (stable hash, not random).
+        # Use one deterministic decision per drive so it is consistent across dates.
         if serial not in keep_cache:
             serial = str(serial)
             keep_cache[serial] = serial in failed or (
@@ -125,14 +123,14 @@ def main():
     out = pd.concat(parts, ignore_index=True)
     if out.empty:
         raise SystemExit("No rows matched the requested models and sample.")
-    for c in SMART_COLS:  # make sure every SMART column exists, even if a quarter lacked it
+    for c in SMART_COLS:  # Ensure the output schema is consistent across archives.
         if c not in out.columns:
             out[c] = pd.NA
     out["date"] = pd.to_datetime(out["date"])
     out["serial_number"] = out["serial_number"].astype(str)
 
-    # Weight = how many real drives each kept row stands for.
-    # Failed drives are all kept (weight 1); healthy drives were sampled (weight 1/sample).
+    # Each retained row represents one drive or, for sampled healthy drives,
+    # the inverse of the sampling fraction.
     out["was_failed_drive"] = out["serial_number"].isin(failed).astype(int)
     out["weight"] = out["was_failed_drive"].map({1: 1.0, 0: 1.0 / args.sample})
 

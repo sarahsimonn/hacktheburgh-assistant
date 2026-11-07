@@ -1,23 +1,20 @@
-"""
-STEP 2 - Label the data, train the model, test it honestly.
+"""Label the prepared data, train a classifier, and evaluate it on held-out data.
 
-What it does (in plain English):
-  1. LABEL: for every drive on every day -> "did this drive fail within the next 30 days?" (yes/no)
-  2. FEATURES: the SMART health readings + how much each error counter grew in the last 7 days
-     + drive age + model.
-  3. SPLIT BY TIME: train on the earlier dates, test on the later dates, with a 30-day gap
-     so the model can never peek at the future.
-  4. TRAIN a weighted gradient-boosted tree model, using each row's sampling weight.
-  5. TEST it against a simple rule ("flag any drive with any error count above zero").
-  6. SAVE a "fleet snapshot" - every drive on the first test day with its risk score -
-     which the dashboard (step 3) uses.
+The pipeline labels each drive-day according to whether the drive fails within
+the configured forecast horizon, derives SMART-based features, and evaluates a
+weighted gradient-boosted tree model. With the default time split, earlier
+dates are used for training and later dates for testing, separated by a gap
+equal to the forecast horizon. A simple error-counter rule is evaluated as a
+baseline. The script also saves a fleet snapshot for the dashboard in step 3.
 
 Run:
     python step2_train.py --data data/drives_small.parquet
 
 Options:
-    --horizon 30      predict failure within this many days
-    --split time      (default, most honest) or 'drive' (use if you only have ONE quarter of data)
+    --horizon 30  Predict failure within this many days.
+    --split time  Use a chronological split (the default); ``drive`` assigns
+                  drives to train or test and can be useful with one quarter
+                  of data.
 """
 import argparse
 import json
@@ -30,16 +27,17 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-ERROR_COUNTERS = [5, 187, 188, 197, 198, 199]  # SMART stats that count problems
+ERROR_COUNTERS = [5, 187, 188, 197, 198, 199]  # SMART attributes used as error indicators.
 
 
 def build_features(df):
+    """Convert raw measurements into model features and return their names."""
     df = df.sort_values(["serial_number", "date"]).reset_index(drop=True)
     feats = []
     for i in ERROR_COUNTERS:
         col = f"smart_{i}_raw"
         df[col] = pd.to_numeric(df[col], errors="coerce")
-        # How much did this error counter grow over the last 7 readings?
+        # Difference from the value seven observations earlier for this drive.
         df[f"d7_smart_{i}"] = df.groupby("serial_number")[col].diff(7).fillna(0)
         feats += [col, f"d7_smart_{i}"]
     for i in [12, 194]:
@@ -54,24 +52,27 @@ def build_features(df):
 
 
 def add_labels(df, horizon):
+    """Add the forecast label and remove rows without a complete forecast window."""
     fail_date = df.loc[df["failure"] == 1].groupby("serial_number")["date"].min()
     df["fail_date"] = df["serial_number"].map(fail_date)
     days_to_fail = (df["fail_date"] - df["date"]).dt.days
     df["label"] = ((days_to_fail >= 0) & (days_to_fail <= horizon)).astype(int)
-    # Rows in the last `horizon` days can't be labelled yet (we can't see far enough ahead).
+    # The final horizon days cannot be labelled because their future is unobserved.
     last_day = df["date"].max()
     df = df[df["date"] <= last_day - pd.Timedelta(days=horizon)]
-    df = df[~(days_to_fail.reindex(df.index) < 0)]  # safety: drop any rows after a failure
+    # Exclude observations recorded after a drive's first failure.
+    df = df[~(days_to_fail.reindex(df.index) < 0)]
     return df
 
 
 def split(df, how, horizon):
+    """Split labelled rows chronologically or by a deterministic drive hash."""
     if how == "time":
         dates = np.sort(df["date"].unique())
         cut = pd.Timestamp(dates[int(len(dates) * 0.6)])
-        train = df[df["date"] <= cut - pd.Timedelta(days=horizon)]  # gap: no peeking
+        train = df[df["date"] <= cut - pd.Timedelta(days=horizon)]  # Leave a horizon-sized gap.
         test = df[df["date"] > cut]
-    else:  # split by drive: 70% of drives for training, 30% for testing
+    else:  # Assign approximately 70% of drives to training and 30% to testing.
         in_test = df["serial_number"].map(lambda s: zlib.crc32(s.encode()) % 10 >= 7)
         train, test = df[~in_test], df[in_test]
     return train, test
@@ -112,8 +113,7 @@ def main():
             "or a different horizon."
         )
 
-    # Train on the sampled data, weighting each row back to its representation
-    # in the real fleet.
+    # Correct for healthy-drive sampling so training reflects the fleet.
     model = HistGradientBoostingClassifier(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
         categorical_features="from_dtype", random_state=0,
@@ -126,7 +126,7 @@ def main():
 
     test = test.copy()
     test["risk"] = model.predict_proba(test[feats])[:, 1]
-    # Simple baseline rule an engineer might use: any error counter above zero.
+    # Baseline rule: flag a drive when any selected error counter is positive.
     err_cols = [f"smart_{i}_raw" for i in ERROR_COUNTERS]
     test["rule"] = (test[err_cols].fillna(0) > 0).any(axis=1).astype(float)
     w = test["weight"]
@@ -141,7 +141,7 @@ def main():
         "rule_roc_auc": float(roc_auc_score(test["label"], test["rule"], sample_weight=w)),
     }
 
-    # Fleet snapshot: every drive on the first test day -> what the dashboard shows.
+    # Save the first test day as the fleet snapshot displayed by the dashboard.
     snap_day = test["date"].min()
     snap = test[test["date"] == snap_day].copy()
     keep = ["serial_number", "model", "age_days", "capacity_tb", "risk", "rule", "label", "weight"] + err_cols + ["smart_194_raw"]
