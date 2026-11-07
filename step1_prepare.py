@@ -16,6 +16,7 @@ Optional:
     --models ST12000NM0008 ST16000NM001G   only keep these drive models
 """
 import argparse
+from pathlib import Path
 import zipfile
 import zlib
 
@@ -51,10 +52,15 @@ def list_daily_csvs(zip_paths):
             yield zp, n
 
 
-def read_csv_from_zip(zip_path, name, wanted):
+def read_csv_from_zip(zip_path, name, wanted, required):
     """Read one daily CSV from inside the ZIP, only loading the columns we want."""
     with zipfile.ZipFile(zip_path) as z, z.open(name) as f:
-        return pd.read_csv(f, usecols=lambda c: c in wanted, low_memory=False)
+        df = pd.read_csv(f, usecols=lambda c: c in wanted, low_memory=False)
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{zip_path}:{name} is missing required columns: {sorted(missing)}")
+    df["serial_number"] = df["serial_number"].astype("string").str.strip()
+    return df.dropna(subset=["serial_number"])
 
 
 def main():
@@ -66,6 +72,8 @@ def main():
     p.add_argument("--models", nargs="*", default=None,
                    help="only keep these drive models (default: all)")
     args = p.parse_args()
+    if not 0 < args.sample <= 1:
+        p.error("--sample must be greater than 0 and at most 1")
 
     files = list(list_daily_csvs(args.zips))
     if not files:
@@ -75,11 +83,15 @@ def main():
     # ---------- Pass 1: which drives failed, and when? ----------
     failed = {}  # serial_number -> failure date
     for i, (zp, name) in enumerate(files, 1):
-        df = read_csv_from_zip(zp, name, {"date", "serial_number", "failure", "model"})
+        df = read_csv_from_zip(
+            zp, name, {"date", "serial_number", "failure", "model"},
+            {"date", "serial_number", "failure", "model"},
+        )
         if args.models:
             df = df[df["model"].isin(args.models)]
-        for s, d in df.loc[df["failure"] == 1, ["serial_number", "date"]].itertuples(index=False):
-            failed[s] = d
+        failures = pd.to_numeric(df["failure"], errors="coerce").eq(1)
+        for s, d in df.loc[failures, ["serial_number", "date"]].itertuples(index=False):
+            failed[str(s)] = d
         if i % 10 == 0 or i == len(files):
             print(f"  pass 1: {i}/{len(files)} files, failures so far: {len(failed)}")
 
@@ -90,13 +102,19 @@ def main():
     def keep(serial):
         # Same drive always gets the same decision on every day (stable hash, not random).
         if serial not in keep_cache:
-            keep_cache[serial] = serial in failed or (zlib.crc32(serial.encode()) % 10_000) < threshold
+            serial = str(serial)
+            keep_cache[serial] = serial in failed or (
+                zlib.crc32(serial.encode()) % 10_000
+            ) < threshold
         return keep_cache[serial]
 
     wanted = set(BASE_COLS + SMART_COLS)
     parts = []
     for i, (zp, name) in enumerate(files, 1):
-        df = read_csv_from_zip(zp, name, wanted)
+        df = read_csv_from_zip(
+            zp, name, wanted,
+            {"date", "serial_number", "model", "capacity_bytes", "failure"},
+        )
         if args.models:
             df = df[df["model"].isin(args.models)]
         df = df[df["serial_number"].astype(str).map(keep)]
@@ -105,6 +123,8 @@ def main():
             print(f"  pass 2: {i}/{len(files)} files")
 
     out = pd.concat(parts, ignore_index=True)
+    if out.empty:
+        raise SystemExit("No rows matched the requested models and sample.")
     for c in SMART_COLS:  # make sure every SMART column exists, even if a quarter lacked it
         if c not in out.columns:
             out[c] = pd.NA
@@ -116,10 +136,12 @@ def main():
     out["was_failed_drive"] = out["serial_number"].isin(failed).astype(int)
     out["weight"] = out["was_failed_drive"].map({1: 1.0, 0: 1.0 / args.sample})
 
-    out.to_parquet(args.out, index=False)
+    output_path = Path(args.out)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(output_path, index=False)
     n_drives = out["serial_number"].nunique()
     print(f"\nSaved {len(out):,} rows, {n_drives:,} drives "
-          f"({len(failed):,} failed) -> {args.out}")
+          f"({len(failed):,} failed) -> {output_path}")
 
 
 if __name__ == "__main__":
