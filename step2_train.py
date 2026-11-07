@@ -21,6 +21,7 @@ Options:
 """
 import argparse
 import json
+from pathlib import Path
 import zlib
 
 import joblib
@@ -81,7 +82,11 @@ def main():
     p.add_argument("--data", default="data/drives_small.parquet")
     p.add_argument("--horizon", type=int, default=30)
     p.add_argument("--split", choices=["time", "drive"], default="time")
+    p.add_argument("--out-dir", default="data",
+                   help="directory for the model, metrics, and snapshot outputs")
     args = p.parse_args()
+    if args.horizon <= 0:
+        p.error("--horizon must be greater than 0")
 
     df = pd.read_parquet(args.data)
     df["date"] = pd.to_datetime(df["date"])
@@ -96,6 +101,16 @@ def main():
               "Add another quarter of data, or re-run with --split drive.")
     if len(train) == 0 or len(test) == 0:
         raise SystemExit("Train or test set is empty. Use more data or --split drive.")
+    if train["label"].nunique() < 2:
+        raise SystemExit(
+            "Train set contains only one label class; use more data, a different split, "
+            "or a different horizon."
+        )
+    if test["label"].nunique() < 2:
+        raise SystemExit(
+            "Test set contains only one label class; use more data, a different split, "
+            "or a different horizon."
+        )
 
     # Train on the sampled data, weighting each row back to its representation
     # in the real fleet.
@@ -136,16 +151,19 @@ def main():
     metrics["snapshot_drives_sampled"] = int(len(snap))
     metrics["snapshot_drives_estimated"] = float(snap["weight"].sum())
 
-    snap.to_parquet("data/snapshot.parquet", index=False)
-    joblib.dump({"model": model, "features": feats}, "data/model.joblib")
-    with open("data/metrics.json", "w") as f:
+    output_dir = Path(args.out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snap.to_parquet(output_dir / "snapshot.parquet", index=False)
+    joblib.dump({"model": model, "features": feats}, output_dir / "model.joblib")
+    with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
     print("\nResults on the TEST period (higher is better):")
     print(f"  Real failure rate:            {metrics['test_failure_rate']:.4%} of drive-days")
     print(f"  Avg precision  model / rule:  {metrics['model_avg_precision']:.3f} / {metrics['rule_avg_precision']:.3f}")
     print(f"  ROC AUC        model / rule:  {metrics['model_roc_auc']:.3f} / {metrics['rule_roc_auc']:.3f}")
-    print(f"\nSaved data/model.joblib, data/metrics.json, data/snapshot.parquet "
+    print(f"\nSaved {output_dir / 'model.joblib'}, {output_dir / 'metrics.json'}, "
+          f"{output_dir / 'snapshot.parquet'} "
           f"(fleet snapshot for {metrics['snapshot_date']}).")
 
 
