@@ -7,7 +7,7 @@ What it does (in plain English):
      + drive age + model.
   3. SPLIT BY TIME: train on the earlier dates, test on the later dates, with a 30-day gap
      so the model can never peek at the future.
-  4. TRAIN a gradient-boosted tree model (scikit-learn, no extra installs).
+  4. TRAIN a weighted gradient-boosted tree model, using each row's sampling weight.
   5. TEST it against a simple rule ("flag any drive with any error count above zero").
   6. SAVE a "fleet snapshot" - every drive on the first test day with its risk score -
      which the dashboard (step 3) uses.
@@ -97,24 +97,20 @@ def main():
     if len(train) == 0 or len(test) == 0:
         raise SystemExit("Train or test set is empty. Use more data or --split drive.")
 
-    # Train on the sampled data (easier for the model: fewer healthy rows) ...
+    # Train on the sampled data, weighting each row back to its representation
+    # in the real fleet.
     model = HistGradientBoostingClassifier(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
         categorical_features="from_dtype", random_state=0,
     )
-    model.fit(train[feats], train["label"])
-
-    # ... then correct the probabilities back to the REAL fleet, where healthy drives
-    # are far more common than in our sample.
-    neg = train["label"] == 0
-    neg_weight = train.loc[neg, "weight"].sum() / neg.sum()
-
-    def risk(X):
-        p_raw = model.predict_proba(X)[:, 1]
-        return p_raw / (p_raw + (1 - p_raw) * neg_weight)
+    model.fit(
+        train[feats],
+        train["label"],
+        sample_weight=train["weight"],
+    )
 
     test = test.copy()
-    test["risk"] = risk(test[feats])
+    test["risk"] = model.predict_proba(test[feats])[:, 1]
     # Simple baseline rule an engineer might use: any error counter above zero.
     err_cols = [f"smart_{i}_raw" for i in ERROR_COUNTERS]
     test["rule"] = (test[err_cols].fillna(0) > 0).any(axis=1).astype(float)
@@ -141,7 +137,7 @@ def main():
     metrics["snapshot_drives_estimated"] = float(snap["weight"].sum())
 
     snap.to_parquet("data/snapshot.parquet", index=False)
-    joblib.dump({"model": model, "features": feats, "neg_weight": neg_weight}, "data/model.joblib")
+    joblib.dump({"model": model, "features": feats}, "data/model.joblib")
     with open("data/metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
