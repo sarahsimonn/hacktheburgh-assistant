@@ -32,32 +32,57 @@ ERROR_COUNTERS = [5, 187, 188, 197, 198, 199]  # SMART attributes used as error 
 
 def build_features(df):
     """Convert raw measurements into model features and return their names."""
+    # Sorting is required before calculating lagged values. Without it, the
+    # seven-observation difference could compare unrelated dates for the same drive.
     df = df.sort_values(["serial_number", "date"]).reset_index(drop=True)
     feats = []
     for i in ERROR_COUNTERS:
         col = f"smart_{i}_raw"
+        # Backblaze SMART fields may contain blanks or non-numeric values.
+        # Coercing them to NaN lets the estimator handle missing measurements.
         df[col] = pd.to_numeric(df[col], errors="coerce")
         # Difference from the value seven observations earlier for this drive.
+        # A positive value indicates that the counter increased; filling the
+        # initial missing lag with zero means no change is assumed until a
+        # seven-observation history is available.
         df[f"d7_smart_{i}"] = df.groupby("serial_number")[col].diff(7).fillna(0)
         feats += [col, f"d7_smart_{i}"]
     for i in [12, 194]:
         col = f"smart_{i}_raw"
         df[col] = pd.to_numeric(df[col], errors="coerce")
         feats.append(col)
+    # SMART attribute 9 reports hours in service, so convert it to days.
     df["age_days"] = pd.to_numeric(df["smart_9_raw"], errors="coerce") / 24
+    # Capacity is stored in bytes; use terabytes so the feature is easier to
+    # interpret and remains on a manageable numeric scale.
     df["capacity_tb"] = pd.to_numeric(df["capacity_bytes"], errors="coerce") / 1e12
+    # HistGradientBoostingClassifier can consume pandas categorical columns
+    # when categorical_features="from_dtype" is enabled below.
     df["model"] = df["model"].astype("category")
     feats += ["age_days", "capacity_tb", "model"]
     return df, feats
 
 
 def add_labels(df, horizon):
-    """Add the forecast label and remove rows without a complete forecast window."""
+    """Add forecast labels and remove rows outside the usable observation window.
+
+    Rows in the final forecast horizon are excluded because their future is not
+    fully observed. Rows recorded after a drive's first failure are also
+    excluded. Other rows remain in the data, including rows for drives with no
+    recorded failure.
+    label = 1: the drive fails on that date or within the next `horizon` days.
+    label = 0: the drive does not fail within the next `horizon` days.
+    """
+    # Use the first recorded failure for each drive as the prediction target.
+    # A drive can have many daily rows, but it has only one first-failure date.
     fail_date = df.loc[df["failure"] == 1].groupby("serial_number")["date"].min()
     df["fail_date"] = df["serial_number"].map(fail_date)
     days_to_fail = (df["fail_date"] - df["date"]).dt.days
+    # Positive labels are drive-day rows whose failure occurs between the
+    # observation date and `horizon` days afterward, inclusive. Rows for drives
+    # with no known failure have NaN days_to_fail and therefore receive label 0.
     df["label"] = ((days_to_fail >= 0) & (days_to_fail <= horizon)).astype(int)
-    # The final horizon days cannot be labelled because their future is unobserved.
+    # The final horizon days cannot be labeled because their future is unobserved.
     last_day = df["date"].max()
     df = df[df["date"] <= last_day - pd.Timedelta(days=horizon)]
     # Exclude observations recorded after a drive's first failure.
@@ -66,13 +91,20 @@ def add_labels(df, horizon):
 
 
 def split(df, how, horizon):
-    """Split labelled rows chronologically or by a deterministic drive hash."""
+    """Split labeled rows chronologically or by a deterministic drive hash."""
     if how == "time":
+        # Select a date boundary at approximately 60% of the observed period.
+        # The test set contains only dates after this boundary.
         dates = np.sort(df["date"].unique())
         cut = pd.Timestamp(dates[int(len(dates) * 0.6)])
+        # Keep the forecast horizon out of the training period. This prevents
+        # training rows immediately before the boundary from overlapping the
+        # future window represented by the first test rows.
         train = df[df["date"] <= cut - pd.Timedelta(days=horizon)]  # Leave a horizon-sized gap.
         test = df[df["date"] > cut]
     else:  # Assign approximately 70% of drives to training and 30% to testing.
+        # Hashing makes the assignment deterministic while keeping all rows
+        # from a drive in the same partition, preventing drive-level leakage.
         in_test = df["serial_number"].map(lambda s: zlib.crc32(s.encode()) % 10 >= 7)
         train, test = df[~in_test], df[in_test]
     return train, test
@@ -90,13 +122,16 @@ def main():
         p.error("--horizon must be greater than 0")
 
     df = pd.read_parquet(args.data)
+    # Normalize dates before calculating time differences and selecting splits.
     df["date"] = pd.to_datetime(df["date"])
     df, feats = build_features(df)
     df = add_labels(df, args.horizon)
     train, test = split(df, args.split, args.horizon)
 
-    print(f"Train rows: {len(train):,} (positives {train['label'].sum():,}) | "
-          f"Test rows: {len(test):,} (positives {test['label'].sum():,})")
+    # These are drive-day rows, not necessarily unique drives. A positive row
+    # represents a drive that fails within the configured forecast horizon.
+    print(f"Train rows: {len(train):,} (positives (fails within {args.horizon} days) {train['label'].sum():,}) | "
+          f"Test rows: {len(test):,} (positives (fails within {args.horizon} days) {test['label'].sum():,})")
     if train["label"].sum() < 20 or test["label"].sum() < 20:
         print("WARNING: very few failures to learn from/test on. "
               "Add another quarter of data, or re-run with --split drive.")
@@ -113,7 +148,9 @@ def main():
             "or a different horizon."
         )
 
-    # Correct for healthy-drive sampling so training reflects the fleet.
+    # The preparation step retains every failed drive but samples healthy
+    # drives. The saved row weights compensate for that sampling so the model
+    # learns from a distribution closer to the full fleet.
     model = HistGradientBoostingClassifier(
         max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
         categorical_features="from_dtype", random_state=0,
@@ -125,12 +162,17 @@ def main():
     )
 
     test = test.copy()
+    # predict_proba(... )[:, 1] is the model's estimated probability that each
+    # drive-day belongs to the positive class (failure within the horizon).
     test["risk"] = model.predict_proba(test[feats])[:, 1]
     # Baseline rule: flag a drive when any selected error counter is positive.
     err_cols = [f"smart_{i}_raw" for i in ERROR_COUNTERS]
     test["rule"] = (test[err_cols].fillna(0) > 0).any(axis=1).astype(float)
     w = test["weight"]
 
+    # Weight evaluation by the same fleet-representation weights used during
+    # training. Average precision is useful for this rare-event problem;
+    # ROC AUC measures ranking quality across all classification thresholds.
     metrics = {
         "horizon_days": args.horizon,
         "split": args.split,
@@ -142,12 +184,16 @@ def main():
     }
 
     # Save the first test day as the fleet snapshot displayed by the dashboard.
+    # This gives the dashboard a single, consistently dated fleet view rather
+    # than mixing rows from different dates.
     snap_day = test["date"].min()
     snap = test[test["date"] == snap_day].copy()
     keep = ["serial_number", "model", "age_days", "capacity_tb", "risk", "rule", "label", "weight"] + err_cols + ["smart_194_raw"]
     snap = snap[keep].rename(columns={"label": "failed_within_horizon"})
     snap["model"] = snap["model"].astype(str)
     metrics["snapshot_date"] = str(snap_day.date())
+    # The row count is the sampled view; the sum of weights estimates the
+    # number of drives represented in the full fleet.
     metrics["snapshot_drives_sampled"] = int(len(snap))
     metrics["snapshot_drives_estimated"] = float(snap["weight"].sum())
 
