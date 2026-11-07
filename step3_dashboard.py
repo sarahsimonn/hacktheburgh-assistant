@@ -12,6 +12,7 @@ It opens in your browser. Use the sliders on the left to set:
 compared with simple strategies an engineer might use instead.
 """
 import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -23,11 +24,13 @@ ERR = {5: "Reallocated sectors", 187: "Uncorrectable errors", 188: "Command time
 
 st.set_page_config(page_title="Drive failure predictor", layout="wide")
 
+DATA_DIR = Path(__file__).resolve().parent / "data"
+
 
 @st.cache_data
 def load():
-    snap = pd.read_parquet("data/snapshot.parquet")
-    with open("data/metrics.json") as f:
+    snap = pd.read_parquet(DATA_DIR / "snapshot.parquet")
+    with open(DATA_DIR / "metrics.json") as f:
         metrics = json.load(f)
     return snap, metrics
 
@@ -57,8 +60,14 @@ def pick(order_score, eligible=None):
     if eligible is not None:
         df = df[eligible]
     df = df.sort_values("score", ascending=False)
-    chosen = df[df["weight"].cumsum() <= budget]
-    return set(chosen["serial_number"])
+    chosen = []
+    used = 0.0
+    for row in df.itertuples():
+        weight = float(row.weight)
+        if used + weight <= budget:
+            chosen.append(row.serial_number)
+            used += weight
+    return set(chosen)
 
 
 def evaluate(chosen):

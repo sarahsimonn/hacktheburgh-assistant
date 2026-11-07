@@ -55,6 +55,9 @@ This keeps every failed drive + 3% of healthy drives + only the ~10 useful colum
 ```
 python step2_train.py
 ```
+Use `--out-dir` to write the model artifacts somewhere other than `data/`; pass the
+same directory's `snapshot.parquet` and `metrics.json` to the dashboard by placing
+them under `data/` before launching it.
 It prints how well the model does on the **test period** vs a simple rule ("flag any drive with any error > 0"):
 - **Average precision:** how good the model is at putting real failures at the top of the list (higher = better). This is the key number for a rare event.
 - **ROC AUC:** 0.5 = coin flip, 1.0 = perfect.
