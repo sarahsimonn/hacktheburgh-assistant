@@ -87,7 +87,7 @@ The feature pipeline:
 
 * coerces SMART values to numeric values and preserves missing measurements;
 * uses raw values and seven-observation deltas for SMART attributes 5, 187, 188, 197, 198, and 199;
-* includes raw SMART attributes 12 and 194;
+* includes current readings for SMART attribute 12 (power-cycle count) and SMART attribute 194 (drive temperature) as context features rather than deltas;
 * converts SMART attribute 9 (power-on hours) to `age_days`;
 * converts `capacity_bytes` to `capacity_tb`; and
 * treats `model` as a categorical feature.
@@ -96,7 +96,14 @@ The target is a drive-day label: `1` when the drive's first recorded failure is 
 
 The default time split uses the first approximately 60% of dates for training and later dates for testing, with a horizon-sized gap between them. This gap prevents training observations near the boundary from overlapping the future window represented by test observations. `--split drive` assigns all rows for a drive to one partition using a deterministic hash and is useful when only a single quarter is available, but it does not provide the same temporal generalization test.
 
-The model is `sklearn.ensemble.HistGradientBoostingClassifier` with fixed hyperparameters and `random_state=0`. Evaluation reports weighted average precision and weighted ROC AUC for both the model and a baseline that flags any positive value in SMART error counters 5, 187, 188, 197, 198, or 199. Average precision is the primary ranking metric because failure is a rare event; accuracy would be misleading for this class distribution.
+The model is `sklearn.ensemble.HistGradientBoostingClassifier` with fixed hyperparameters and `random_state=0`. Evaluation reports weighted average precision and weighted ROC AUC for both the model and a baseline that flags any positive value in SMART error counters 5, 187, 188, 197, 198, or 199.
+
+The evaluation criteria measure different aspects of ranking quality:
+
+* **Average precision (AP)** summarizes the precision-recall curve across score thresholds. It rewards a model for placing actual failures near the top of the replacement queue while penalizing false positives, and is the primary metric because failures are rare. An AP of `1.0` is perfect; values closer to the observed failure prevalence indicate limited ranking value.
+* **ROC AUC** measures how often the model assigns a higher risk score to a randomly selected failing drive-day than to a randomly selected non-failing drive-day, across all thresholds. `0.5` represents random ranking and `1.0` perfect separation. ROC AUC is useful as a general ranking measure, but can appear strong even when precision is low in a highly imbalanced dataset.
+
+Both metrics are weighted using the healthy-drive sampling weights. Accuracy is not reported because a model that predicts no failures could achieve high accuracy while providing no useful replacement prioritization.
 
 The command writes three files to `--out-dir`:
 

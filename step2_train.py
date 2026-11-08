@@ -47,6 +47,8 @@ def build_features(df):
         # seven-observation history is available.
         df[f"d7_smart_{i}"] = df.groupby("serial_number")[col].diff(7).fillna(0)
         feats += [col, f"d7_smart_{i}"]
+    # SMART 12 is power-cycle count and SMART 194 is drive temperature;
+    # retain their current readings as context features rather than deltas.
     for i in [12, 194]:
         col = f"smart_{i}_raw"
         df[col] = pd.to_numeric(df[col], errors="coerce")
